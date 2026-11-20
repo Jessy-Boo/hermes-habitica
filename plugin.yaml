@@ -1,0 +1,42 @@
+name: hermes-habitica
+label: Habitica
+kind: tools
+version: 1.0.0
+manifest_version: 1
+author: Jessy-Boo
+license: MIT
+homepage: https://github.com/Jessy-Boo/hermes-habitica
+tags: [habitica, gtd, tasks, habits, gamification, party]
+description: "Manage a Habitica character from Hermes: view stats and streaks, tick habits and dailies, create and edit tasks and rewards, and follow party and quest progress, with optional party chat posting. Disclosure: calls habitica.com/api/v3 with your stored user ID and API token; ticks, edits and deletes are irreversible writes that change streaks, stats and gold; party chat posts are visible to party members; not affiliated with or endorsed by Habitica."
+requires_hermes: ">=0.21"
+requires_env:
+  - name: HABITICA_USER_ID
+    description: "Habitica user ID (Settings, Site, and Mobile Data page, API column)"
+    prompt: "Habitica user ID"
+    secret: true
+    url: https://habitica.com/user/settings/site
+  - name: HABITICA_API_TOKEN
+    description: "Habitica API token (same page, API column, Show API Token)"
+    prompt: "Habitica API token"
+    secret: true
+    url: https://habitica.com/user/settings/site
+provides_tools:
+  - habitica_status
+  - habitica_tasks
+  - habitica_task_create
+  - habitica_task_update
+  - habitica_task_delete
+  - habitica_tick
+  - habitica_tags
+  - habitica_party
+config_schema:
+  request_timeout_seconds:
+    type: int
+    default: 30
+    label: "Request timeout (seconds)"
+    description: "HTTP timeout for calls to habitica.com."
+  chat_fetch_limit:
+    type: int
+    default: 20
+    label: "Party chat fetch limit"
+    description: "Most recent party chat messages habitica_party returns for the chat_list action."
