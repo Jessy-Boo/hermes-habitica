@@ -1,25 +1,35 @@
 """Habitica agent tools: status, tasks CRUD, scoring, tags and party.
 
 Registered in every Hermes process via ``provides_tools`` in plugin.yaml.
+
+Handler contract (``tools/registry.py``): the dispatcher calls a plugin
+tool as ``handler(args, **kwargs)`` where ``args`` is the model's argument
+dict and ``**kwargs`` carries dispatcher context fields (``task_id``,
+``session_id``, ``user_task``, ...) filtered by the handler's signature.
+A handler must therefore take ``args`` as its only meaningful parameter,
+read the model's arguments out of it, and return a string (JSON here).
+A handler that declares a name the dispatcher also injects receives two
+values for it and crashes; the public handlers below never declare one.
+
+Irreversible and socially visible actions are additionally gated through
+Hermes' human-approval system: ``_on_pre_tool_call`` returns an
+``approve`` directive for ``habitica_task_delete`` and for the party
+``chat_post`` / ``chat_delete`` actions, so Hermes asks the human before
+any such call runs. Scoring stays description-guarded (a tick is a
+routine, usually-positive action and the bread and butter of the plugin);
+deletes and chat writes require a human tap.
+
 Handlers build a lazily-resolved ``HabiticaClient`` unless the caller
 injects one, which is how the unit tests drive everything through a fake
 transport with no live network.
-
-Safety posture, stated in the tool descriptions because that is the only
-steering the model sees:
-
-- scoring a task is an irreversible write that changes streaks, stats and
-  gold, so ``habitica_tick`` says to use it only when the user names the
-  task or explicitly asks to tick it
-- deletes are irreversible, so ``habitica_task_delete`` and the chat
-  delete action say so plainly
-- party chat posts are visible to party members
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Optional
+import uuid
+from typing import Any, Callable, Optional
 
 from .client import HabiticaClient, HabiticaError
 from .settings import load_settings
@@ -133,8 +143,20 @@ def _clean_task_body(body: dict, task_type: str | None = None) -> dict:
     return out
 
 
+def _require_uuid(value: str, field: str) -> str:
+    """Model-supplied ids go into URL paths; validate them as UUIDs."""
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        raise HabiticaError(field + " must be a valid UUID") from None
+
+
 # ----------------------------------------------------------------------
 # tool handlers (client injectable for tests)
+#
+# Public signature is the Hermes tool contract: ``handler(args, **kwargs)
+# -> str``. The ``_impl_*`` functions hold the behaviour and stay simple
+# to test; the public wrapper validates, delegates, and JSON-encodes.
 # ----------------------------------------------------------------------
 
 
@@ -144,10 +166,11 @@ def _make_client(client: Optional[HabiticaClient], timeout: float) -> HabiticaCl
     return HabiticaClient.resolve(timeout=timeout)
 
 
-def habitica_status(client: Optional[HabiticaClient] = None, **_kwargs) -> dict:
-    """Character stats, balances and a streaks digest."""
-    settings = load_settings()
-    c = _make_client(client, float(settings["request_timeout_seconds"]))
+def _settings() -> dict[str, Any]:
+    return load_settings()
+
+
+def _impl_status(c: HabiticaClient) -> dict:
     user = c.user()
     data = user.get("stats") or {}
     balance = user.get("balance")
@@ -186,18 +209,18 @@ def habitica_status(client: Optional[HabiticaClient] = None, **_kwargs) -> dict:
     }
 
 
-def habitica_tasks(
-    task_type: str,
-    include_completed: bool = False,
-    limit: int = 50,
-    client: Optional[HabiticaClient] = None,
-    **_kwargs,
-) -> dict:
-    """List tasks of one type (one type per API request)."""
+def habitica_status(args: dict, client: Optional[HabiticaClient] = None, **_ctx) -> str:
+    """Character stats, balances and a streaks digest."""
+    try:
+        c = _make_client(client, float(_settings()["request_timeout_seconds"]))
+        return json.dumps(_impl_status(c), ensure_ascii=False)
+    except HabiticaError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _impl_tasks(c: HabiticaClient, task_type: str, include_completed: bool, limit: int) -> dict:
     if task_type not in TASK_TYPES:
         raise HabiticaError("task_type must be one of: " + ", ".join(TASK_TYPES))
-    settings = load_settings()
-    c = _make_client(client, float(settings["request_timeout_seconds"]))
     tasks = c.tasks(task_type)
     if not include_completed:
         tasks = [t for t in tasks if not t.get("completed")]
@@ -205,118 +228,100 @@ def habitica_tasks(
     return {"count": len(tasks), "tasks": [_task_summary(t) for t in tasks]}
 
 
-def habitica_task_create(
-    task_type: str,
-    text: str,
-    difficulty: str = "easy",
-    notes: str = "",
-    checklist: Optional[list] = None,
-    tags: Optional[list] = None,
-    up: Optional[bool] = None,
-    down: Optional[bool] = None,
-    frequency: Optional[str] = None,
-    every_x: Optional[int] = None,
-    repeat_days: Optional[list] = None,
-    value: Optional[float] = None,
-    client: Optional[HabiticaClient] = None,
-    **_kwargs,
-) -> dict:
-    """Create a habit, daily, todo or reward."""
+def habitica_tasks(args: dict, client: Optional[HabiticaClient] = None, **_ctx) -> str:
+    """List tasks of one type (one type per API request)."""
+    try:
+        c = _make_client(client, float(_settings()["request_timeout_seconds"]))
+        return json.dumps(
+            _impl_tasks(
+                c,
+                str(args.get("task_type") or ""),
+                bool(args.get("include_completed")),
+                int(args.get("limit") or 50),
+            ),
+            ensure_ascii=False,
+        )
+    except HabiticaError as exc:
+        return json.dumps({"error": str(exc)})
+    except (TypeError, ValueError) as exc:
+        return json.dumps({"error": "bad argument: " + str(exc)})
+
+
+def _impl_task_create(c: HabiticaClient, body: dict, task_type: str) -> dict:
     if task_type not in TASK_TYPES:
         raise HabiticaError("task_type must be one of: " + ", ".join(TASK_TYPES))
-    if not text or not str(text).strip():
+    if not body.get("text") or not str(body["text"]).strip():
         raise HabiticaError("text is required")
-    body = _clean_task_body(
-        {
-            "text": text,
-            "notes": notes,
-            "difficulty": difficulty,
-            "tags": tags,
-            "checklist": checklist,
-            "up": up,
-            "down": down,
-            "frequency": frequency,
-            "every_x": every_x,
-            "repeat_days": repeat_days,
-            "value": value,
-        },
-        task_type,
-    )
-    body["type"] = task_type
-    settings = load_settings()
-    c = _make_client(client, float(settings["request_timeout_seconds"]))
-    created = c.create_task(body)
+    clean = _clean_task_body(body, task_type)
+    clean["type"] = task_type
+    created = c.create_task(clean)
     return {"created": True, "task": _task_summary(created)}
 
 
-def habitica_task_update(
-    task_id: str,
-    text: Optional[str] = None,
-    difficulty: Optional[str] = None,
-    notes: Optional[str] = None,
-    checklist: Optional[list] = None,
-    tags: Optional[list] = None,
-    up: Optional[bool] = None,
-    down: Optional[bool] = None,
-    frequency: Optional[str] = None,
-    every_x: Optional[int] = None,
-    repeat_days: Optional[list] = None,
-    value: Optional[float] = None,
-    client: Optional[HabiticaClient] = None,
-    **_kwargs,
-) -> dict:
-    """Update an existing task (partial: only the fields you pass)."""
+def habitica_task_create(args: dict, client: Optional[HabiticaClient] = None, **_ctx) -> str:
+    """Create a habit, daily, todo or reward."""
+    try:
+        c = _make_client(client, float(_settings()["request_timeout_seconds"]))
+        body = dict(args or {})
+        body.pop("task_id", None)
+        task_type = str(body.pop("task_type", ""))
+        body.setdefault("difficulty", "easy")
+        return json.dumps(
+            _impl_task_create(c, body, task_type), ensure_ascii=False
+        )
+    except HabiticaError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _impl_task_update(c: HabiticaClient, task_id: str, body: dict) -> dict:
     if not task_id:
         raise HabiticaError("task_id is required")
-    body = _clean_task_body(
-        {
-            "text": text,
-            "notes": notes,
-            "difficulty": difficulty,
-            "tags": tags,
-            "checklist": checklist,
-            "up": up,
-            "down": down,
-            "frequency": frequency,
-            "every_x": every_x,
-            "repeat_days": repeat_days,
-            "value": value,
-        }
-    )
-    if not body:
+    clean = _clean_task_body(body)
+    if not clean:
         raise HabiticaError("nothing to update: pass at least one field")
-    settings = load_settings()
-    c = _make_client(client, float(settings["request_timeout_seconds"]))
-    updated = c.update_task(task_id, body)
+    clean.pop("task_id", None)
+    updated = c.update_task(_require_uuid(task_id, "task_id"), clean)
     return {"updated": True, "task": _task_summary(updated)}
 
 
-def habitica_task_delete(
-    task_id: str, client: Optional[HabiticaClient] = None, **_kwargs
-) -> dict:
-    """Delete a Habitica task. Irreversible: deleted tasks cannot be restored."""
+def habitica_task_update(args: dict, client: Optional[HabiticaClient] = None, **_ctx) -> str:
+    """Update an existing task (partial: only the fields you pass)."""
+    try:
+        c = _make_client(client, float(_settings()["request_timeout_seconds"]))
+        body = dict(args or {})
+        task_id = str(body.pop("task_id", ""))
+        return json.dumps(
+            _impl_task_update(c, task_id, body), ensure_ascii=False
+        )
+    except HabiticaError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _impl_task_delete(c: HabiticaClient, task_id: str) -> dict:
     if not task_id:
         raise HabiticaError("task_id is required")
-    settings = load_settings()
-    c = _make_client(client, float(settings["request_timeout_seconds"]))
-    c.delete_task(task_id)
+    c.delete_task(_require_uuid(task_id, "task_id"))
     return {"deleted": True, "id": task_id}
 
 
-def habitica_tick(
-    task_id: str,
-    direction: str = "up",
-    client: Optional[HabiticaClient] = None,
-    **_kwargs,
-) -> dict:
-    """Score a task up or down. Irreversible; affects streaks and stats."""
+def habitica_task_delete(args: dict, client: Optional[HabiticaClient] = None, **_ctx) -> str:
+    """Delete a Habitica task. Irreversible: deleted tasks cannot be restored."""
+    try:
+        c = _make_client(client, float(_settings()["request_timeout_seconds"]))
+        task_id = str(args.get("task_id") or "")
+        return json.dumps(
+            _impl_task_delete(c, task_id), ensure_ascii=False
+        )
+    except HabiticaError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _impl_tick(c: HabiticaClient, task_id: str, direction: str) -> dict:
     if direction not in ("up", "down"):
         raise HabiticaError("direction must be up or down")
     if not task_id:
         raise HabiticaError("task_id is required")
-    settings = load_settings()
-    c = _make_client(client, float(settings["request_timeout_seconds"]))
-    result = c.score_task(task_id, direction) or {}
+    result = c.score_task(_require_uuid(task_id, "task_id"), direction) or {}
     # Verified live: stat changes arrive as a top-level "delta", new totals
     # as top-level hp/mp/gp/exp/lvl; "_tmp" only carries drops and quest
     # progress.
@@ -343,10 +348,20 @@ def habitica_tick(
     return out
 
 
-def habitica_tags(client: Optional[HabiticaClient] = None, **_kwargs) -> dict:
-    """List the account's tags with their ids (ids are what the task tools take)."""
-    settings = load_settings()
-    c = _make_client(client, float(settings["request_timeout_seconds"]))
+def habitica_tick(args: dict, client: Optional[HabiticaClient] = None, **_ctx) -> str:
+    """Score a task up or down. Irreversible; affects streaks and stats."""
+    try:
+        c = _make_client(client, float(_settings()["request_timeout_seconds"]))
+        task_id = str(args.get("task_id") or "")
+        direction = str(args.get("direction") or "up")
+        return json.dumps(
+            _impl_tick(c, task_id, direction), ensure_ascii=False
+        )
+    except HabiticaError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _impl_tags(c: HabiticaClient) -> dict:
     tags = c.tags() or []
     return {
         "count": len(tags),
@@ -354,27 +369,24 @@ def habitica_tags(client: Optional[HabiticaClient] = None, **_kwargs) -> dict:
     }
 
 
-def habitica_party(
-    action: str = "summary",
-    message: str = "",
-    message_id: str = "",
-    limit: int = 0,
-    client: Optional[HabiticaClient] = None,
-    **_kwargs,
-) -> dict:
-    """Party and quest status, with optional party chat posting.
+def habitica_tags(args: dict, client: Optional[HabiticaClient] = None, **_ctx) -> str:
+    """List the account's tags with their ids (ids are what the task tools take)."""
+    try:
+        c = _make_client(client, float(_settings()["request_timeout_seconds"]))
+        return json.dumps(_impl_tags(c), ensure_ascii=False)
+    except HabiticaError as exc:
+        return json.dumps({"error": str(exc)})
 
-    Actions: summary (party + quest state, default), chat_list (recent
-    messages), chat_post (visible to party members; messages cannot be
-    unsent except by deleting your own), chat_delete (removes one of your
-    own messages; irreversible).
-    """
+
+def _impl_party(c: HabiticaClient, action: str, message: str, message_id: str, limit: int) -> dict:
     if action not in ("summary", "chat_list", "chat_post", "chat_delete"):
         raise HabiticaError(
             "action must be summary, chat_list, chat_post or chat_delete"
         )
-    settings = load_settings()
-    c = _make_client(client, float(settings["request_timeout_seconds"]))
+    if action == "chat_delete":
+        if not message_id:
+            raise HabiticaError("message_id is required for chat_delete")
+        _require_uuid(message_id, "message_id")
     party = c.party()
     if party is None:
         return {"party": None, "note": "This account is not in a party."}
@@ -399,7 +411,7 @@ def habitica_party(
     if action == "summary":
         return out
     if action == "chat_list":
-        limit = int(limit) if limit else int(settings["chat_fetch_limit"] or 20)
+        limit = int(limit) if limit else int(load_settings()["chat_fetch_limit"] or 20)
         messages = c.party_chat(group_id, limit=limit)
         return {
             **out,
@@ -424,11 +436,77 @@ def habitica_party(
             "posted": True,
             "message_id": posted_message.get("id"),
         }
-    # chat_delete
-    if not message_id:
-        raise HabiticaError("message_id is required for chat_delete")
+    # chat_delete: validated above, before any network call
     c.delete_party_chat(group_id, str(message_id))
     return {**out, "deleted": True, "message_id": message_id}
+
+
+def habitica_party(args: dict, client: Optional[HabiticaClient] = None, **_ctx) -> str:
+    """Party and quest status, with optional party chat posting.
+
+    Actions: summary (party + quest state, default), chat_list (recent
+    messages), chat_post (visible to party members; messages cannot be
+    unsent except by deleting your own), chat_delete (removes one of your
+    own messages; irreversible).
+    """
+    try:
+        c = _make_client(client, float(_settings()["request_timeout_seconds"]))
+        return json.dumps(
+            _impl_party(
+                c,
+                str(args.get("action") or "summary"),
+                str(args.get("message") or ""),
+                str(args.get("message_id") or ""),
+                int(args.get("limit") or 0),
+            ),
+            ensure_ascii=False,
+        )
+    except HabiticaError as exc:
+        return json.dumps({"error": str(exc)})
+    except (TypeError, ValueError) as exc:
+        return json.dumps({"error": "bad argument: " + str(exc)})
+
+
+# ----------------------------------------------------------------------
+# human-approval gate for irreversible / socially visible calls
+# ----------------------------------------------------------------------
+
+
+def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_ctx):
+    """Escalate the destructive actions to Hermes' human-approval gate.
+
+    Returning ``{"action": "approve", ...}`` routes the call through the
+    approval flow (fail-closed: a denied, timed-out or errored gate blocks
+    the call). Everything else returns None and runs normally.
+    """
+    a = args if isinstance(args, dict) else {}
+    if tool_name == "habitica_task_delete":
+        return {
+            "action": "approve",
+            "message": "hermes-habitica: permanently delete the Habitica task "
+            + str(a.get("task_id") or "(unknown id)")
+            + "? This cannot be undone.",
+        }
+    if tool_name == "habitica_party":
+        action = a.get("action")
+        if action == "chat_post":
+            return {
+                "action": "approve",
+                "message": "hermes-habitica: post this message to your party "
+                "chat (visible to party members)?",
+            }
+        if action == "chat_delete":
+            return {
+                "action": "approve",
+                "message": "hermes-habitica: permanently delete this party "
+                "chat message? This cannot be undone.",
+            }
+    return None
+
+
+def register_hooks(ctx) -> None:
+    """Entry point for provides_hooks: called in every Hermes process."""
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
 
 
 # ----------------------------------------------------------------------
@@ -573,7 +651,7 @@ DELETE_SCHEMA = {
     "description": (
         "Delete a Habitica task by id. Irreversible: deleted tasks and "
         "their streak history cannot be restored. Confirm the id with "
-        "habitica_tasks first."
+        "habitica_tasks first. Requires human approval before it runs."
     ),
     "parameters": _params(
         {"task_id": {"type": "string", "description": "Task id to delete."}},
@@ -609,7 +687,8 @@ PARTY_SCHEMA = {
         "Habitica party: summary (party and quest state, default), chat_list "
         "(recent messages), chat_post (sends a message visible to party "
         "members; it cannot be unsent except by deleting your own message) "
-        "or chat_delete (removes one of your own messages, irreversible)."
+        "or chat_delete (removes one of your own messages, irreversible). "
+        "chat_post and chat_delete require human approval before they run."
     ),
     "parameters": _params(
         {

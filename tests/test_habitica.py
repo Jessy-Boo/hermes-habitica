@@ -1,18 +1,25 @@
 """Tests for hermes-habitica. No live network: urllib is faked.
 
-Every test drives the plugin through a fake ``urlopen`` that records the
-requests it receives and replays canned responses, so the gate runs fast,
-deterministically and without touching anyone's Habitica account.
+Two layers are covered:
+
+- client-level: headers, one-type-per-request, backoff, credential
+  resolution, redirect safety, id quoting
+- tool-handler level: the public handlers follow the Hermes plugin tool
+  contract (``handler(args, **kwargs) -> str`` with dispatcher context
+  kwargs injected by signature), so every test calls them exactly the
+  way the dispatcher does, including the context kwargs.
 """
 
 import importlib.util
 import io
+import inspect
 import json
 import os
 import pathlib
 import sys
 import unittest
 import urllib.error
+import urllib.request
 from unittest import mock
 
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parents[1]
@@ -36,6 +43,15 @@ tools = importlib.import_module("hhc_test_pkg.tools")
 HabiticaClient = client_mod.HabiticaClient
 HabiticaCredentialsError = client_mod.HabiticaCredentialsError
 HabiticaError = client_mod.HabiticaError
+
+# a valid UUID every id-based test can use
+TASK_ID = "123e4567-e89b-12d3-a456-426614174000"
+MSG_ID = "00000000-1111-2222-3333-444444444444"
+
+# the context kwargs the Hermes dispatcher injects by signature
+INJECTED = dict(task_id="hermes-task", session_id="hermes-session",
+                user_task="hermes-user-task", parent_agent="hermes-parent",
+                tool_call_id="hermes-call", turn_id="hermes-turn")
 
 
 def api_response(payload, status=200):
@@ -99,6 +115,11 @@ def make_client(script):
         urlopen=fake,
     )
     return c, fake
+
+
+def jout(result):
+    """Parse a handler's JSON string result."""
+    return json.loads(result)
 
 
 USER_PAYLOAD = {
@@ -182,6 +203,36 @@ class ClientTests(unittest.TestCase):
             c.get("user")
         self.assertIn("bad", str(ctx.exception))
 
+    def test_ids_are_quoted_into_path_segments(self):
+        c, fake = make_client([{"payload": {"success": True, "data": {}}}])
+        c.delete_task("../other")
+        self.assertIn("tasks/..%2Fother", fake.last_url())
+
+    def test_redirect_off_habitica_is_refused(self):
+        handler = client_mod._SafeRedirectHandler()
+        req = urllib.request.Request(
+            "https://habitica.com/api/v3/user", headers={"X-api-key": "secret"}
+        )
+        result = handler.redirect_request(
+            req, fp=None, code=302, msg="found", headers=None,
+            newurl="https://evil.example/api",
+        )
+        self.assertIsNone(result)
+
+    def test_same_host_redirect_drops_auth_headers(self):
+        handler = client_mod._SafeRedirectHandler()
+        req = urllib.request.Request(
+            "https://habitica.com/api/v3/old",
+            headers={"X-api-key": "secret", "X-api-user": "uid"},
+        )
+        result = handler.redirect_request(
+            req, fp=None, code=302, msg="found", headers=None,
+            newurl="https://habitica.com/api/v3/new",
+        )
+        self.assertIsNotNone(result)
+        self.assertIsNone(result.get_header("X-api-key"))
+        self.assertIsNone(result.get_header("X-api-user"))
+
 
 class CredentialRouteTests(unittest.TestCase):
     def test_env_values_are_ignored_even_when_set(self):
@@ -204,6 +255,16 @@ class CredentialRouteTests(unittest.TestCase):
         self.assertNotIn("load_" + "dotenv", source)
         self.assertNotIn("getenv", source)
 
+    def test_none_and_empty_secret_results_are_missing(self):
+        # get_secret returns default (None) on a scoped miss instead of
+        # raising; that must read as missing, not as the literal "None"
+        with mock.patch.object(client_mod, "get_secret", return_value=None):
+            with self.assertRaises(HabiticaCredentialsError):
+                client_mod._credentials()
+        with mock.patch.object(client_mod, "get_secret", return_value="   "):
+            with self.assertRaises(HabiticaCredentialsError):
+                client_mod._credentials()
+
 
 class ChatBodyTests(unittest.TestCase):
     def test_chat_post_uses_urlencoded_body_not_query(self):
@@ -213,18 +274,51 @@ class ChatBodyTests(unittest.TestCase):
                 {
                     "payload": {
                         "success": True,
-                        "data": {"message": {"id": "m1", "text": "hello"}},
+                        "data": {"message": {"id": MSG_ID, "text": "hello"}},
                     }
                 },
             ]
         )
-        out = tools.habitica_party(
-            action="chat_post", message="hello world", client=c
-        )
+        out = jout(tools.habitica_party(
+            {"action": "chat_post", "message": "hello world"}, client=c
+        ))
         self.assertTrue(out["posted"])
         url = fake.last_url()
         self.assertNotIn("hello", url)  # message never rides the query string
         self.assertIn("message=hello+world", fake.last_body())
+
+
+class HandlerContractTests(unittest.TestCase):
+    """The Hermes plugin tool contract: handler(args, **kwargs) -> str."""
+
+    def test_every_handler_accepts_injected_context_kwargs(self):
+        for schema, handler in tools.TOOLS:
+            with self.subTest(tool=schema["name"]):
+                result = handler({}, **INJECTED)  # no client: fails closed
+                self.assertIsInstance(result, str, schema["name"])
+                parsed = json.loads(result)
+                self.assertIn("error", parsed, schema["name"])
+                self.assertIn("credentials are not configured", parsed["error"])
+
+    def test_handler_signatures_do_not_redeclare_context_names(self):
+        for schema, handler in tools.TOOLS:
+            params = set(inspect.signature(handler).parameters)
+            self.assertNotIn(
+                "session_id", params, schema["name"]
+            )  # args is the only meaningful param; task_id must not be declared
+
+    def test_handlers_return_strings_not_dicts(self):
+        c, _ = make_client(
+            [{"payload": USER_PAYLOAD}, {"payload": {"success": True, "data": []}},
+             {"payload": {"success": True, "data": [{"id": "g1"}]}}]
+        )
+        for handler, args in (
+            (tools.habitica_status, {}),
+            (tools.habitica_tags, {}),
+            (tools.habitica_party, {"action": "summary"}),
+        ):
+            result = handler(args, client=c, **INJECTED)
+            self.assertIsInstance(result, str)
 
 
 class HandlerTests(unittest.TestCase):
@@ -244,7 +338,7 @@ class HandlerTests(unittest.TestCase):
                 },
             ]
         )
-        out = tools.habitica_status(client=c)
+        out = jout(tools.habitica_status({}, client=c))
         self.assertEqual(out["level"], 5)
         self.assertEqual(out["gems"], 12)
         self.assertEqual(out["top_daily_streaks"][0]["streak"], 302)
@@ -255,7 +349,7 @@ class HandlerTests(unittest.TestCase):
         c, _ = make_client(
             [{"payload": bare}, {"payload": {"success": True, "data": []}}]
         )
-        out = tools.habitica_status(client=c)
+        out = jout(tools.habitica_status({}, client=c))
         self.assertEqual(out["gems"], 0)
 
     def test_tasks_filters_completed_and_validates_type(self):
@@ -272,18 +366,24 @@ class HandlerTests(unittest.TestCase):
                 }
             ]
         )
-        out = tools.habitica_tasks("todo", client=c)
+        out = jout(tools.habitica_tasks({"task_type": "todo"}, client=c))
         self.assertEqual(out["count"], 1)
-        with self.assertRaises(HabiticaError):
-            tools.habitica_tasks("bogus", client=c)
+        out = jout(tools.habitica_tasks({"task_type": "bogus"}, client=c))
+        self.assertIn("error", out)
 
     def test_create_sends_typed_body(self):
         c, fake = make_client(
             [{"payload": {"success": True, "data": {"id": "new1", "type": "daily", "text": "X"}}}]
         )
-        out = tools.habitica_task_create(
-            "daily", "X", frequency="weekly", repeat_days=["m", "f"], client=c
-        )
+        out = jout(tools.habitica_task_create(
+            {
+                "task_type": "daily",
+                "text": "X",
+                "frequency": "weekly",
+                "repeat_days": ["m", "f"],
+            },
+            client=c,
+        ))
         self.assertTrue(out["created"])
         body = json.loads(fake.last_body())
         self.assertEqual(body["type"], "daily")
@@ -293,23 +393,42 @@ class HandlerTests(unittest.TestCase):
 
     def test_create_rejects_bad_difficulty_and_repeat_days(self):
         c, _ = make_client([])
-        with self.assertRaises(HabiticaError):
-            tools.habitica_task_create("habit", "X", difficulty="impossible", client=c)
-        with self.assertRaises(HabiticaError):
-            tools.habitica_task_create("daily", "X", repeat_days=["monday"], client=c)
+        out = jout(tools.habitica_task_create(
+            {"task_type": "habit", "text": "X", "difficulty": "impossible"}, client=c
+        ))
+        self.assertIn("error", out)
+        out = jout(tools.habitica_task_create(
+            {"task_type": "daily", "text": "X", "repeat_days": ["monday"]}, client=c
+        ))
+        self.assertIn("error", out)
 
     def test_update_partial_body(self):
         c, fake = make_client(
-            [{"payload": {"success": True, "data": {"id": "t1", "text": "New"}}}]
+            [{"payload": {"success": True, "data": {"id": TASK_ID, "text": "New"}}}]
         )
-        tools.habitica_task_update("t1", text="New", client=c)
+        out = jout(tools.habitica_task_update(
+            {"task_id": TASK_ID, "text": "New"}, client=c
+        ))
+        self.assertTrue(out["updated"])
         body = json.loads(fake.last_body())
         self.assertEqual(body, {"text": "New"})
 
-    def test_update_with_nothing_raises(self):
+    def test_update_with_nothing_returns_error(self):
         c, _ = make_client([])
-        with self.assertRaises(HabiticaError):
-            tools.habitica_task_update("t1", client=c)
+        out = jout(tools.habitica_task_update({"task_id": TASK_ID}, client=c))
+        self.assertIn("error", out)
+
+    def test_non_uuid_ids_are_rejected_before_any_network_call(self):
+        c, fake = make_client([])
+        for handler, args in (
+            (tools.habitica_tick, {"task_id": "../other", "direction": "up"}),
+            (tools.habitica_task_update, {"task_id": "x?query=1", "text": "hi"}),
+            (tools.habitica_task_delete, {"task_id": "../../admin"}),
+        ):
+            out = jout(handler(args, client=c))
+            self.assertIn("error", out)
+            self.assertIn("valid UUID", out["error"])
+        self.assertEqual(fake.requests, [])  # never reached the network
 
     def test_tick_returns_delta_totals_and_streak(self):
         c, fake = make_client(
@@ -331,7 +450,9 @@ class HandlerTests(unittest.TestCase):
                 }
             ]
         )
-        out = tools.habitica_tick("t1", "up", client=c)
+        out = jout(tools.habitica_tick(
+            {"task_id": TASK_ID, "direction": "up"}, client=c
+        ))
         self.assertEqual(out["scored"], "up")
         self.assertEqual(out["streak"], 303)
         self.assertEqual(out["delta"]["exp"], 5)
@@ -341,16 +462,16 @@ class HandlerTests(unittest.TestCase):
 
     def test_update_response_reports_priority_as_difficulty(self):
         c, _ = make_client(
-            [{"payload": {"success": True, "data": {"id": "t1", "text": "New", "priority": 1.5}}}]
+            [{"payload": {"success": True, "data": {"id": TASK_ID, "text": "New", "priority": 1.5}}}]
         )
-        out = tools.habitica_task_update("t1", text="New", client=c)
+        out = jout(tools.habitica_task_update(
+            {"task_id": TASK_ID, "text": "New"}, client=c
+        ))
         self.assertEqual(out["task"]["difficulty"], 1.5)
 
     def test_party_summary_and_no_party(self):
-        c, _ = make_client(
-            [{"payload": {"success": True, "data": []}}]
-        )
-        out = tools.habitica_party("summary", client=c)
+        c, _ = make_client([{"payload": {"success": True, "data": []}}])
+        out = jout(tools.habitica_party({"action": "summary"}, client=c))
         self.assertIsNone(out["party"])
 
         c2, _ = make_client(
@@ -371,7 +492,7 @@ class HandlerTests(unittest.TestCase):
                 }
             ]
         )
-        out = tools.habitica_party("summary", client=c2)
+        out = jout(tools.habitica_party({"action": "summary"}, client=c2))
         self.assertEqual(out["quest"]["key"], "dustbunnies")
 
     def test_party_chat_list_maps_fields(self):
@@ -391,9 +512,63 @@ class HandlerTests(unittest.TestCase):
                 },
             ]
         )
-        out = tools.habitica_party("chat_list", client=c)
+        out = jout(tools.habitica_party({"action": "chat_list"}, client=c))
         self.assertFalse(out["chat"][0]["system"])
         self.assertTrue(out["chat"][1]["system"])
+
+    def test_party_chat_delete_requires_uuid_message_id(self):
+        c, fake = make_client(
+            [{"payload": {"success": True, "data": [{"id": "g1"}]}},
+             {"payload": {"success": True, "data": {}}}]
+        )
+        out = jout(tools.habitica_party(
+            {"action": "chat_delete", "message_id": MSG_ID}, client=c
+        ))
+        self.assertTrue(out["deleted"])
+        out = jout(tools.habitica_party(
+            {"action": "chat_delete", "message_id": "mid-1"}, client=c
+        ))
+        self.assertIn("error", out)
+
+
+class ApprovalGateTests(unittest.TestCase):
+    def test_destructive_actions_are_gated(self):
+        self.assertEqual(
+            tools._on_pre_tool_call(
+                "habitica_task_delete", args={"task_id": TASK_ID}, **INJECTED
+            )["action"],
+            "approve",
+        )
+        for action in ("chat_post", "chat_delete"):
+            result = tools._on_pre_tool_call(
+                "habitica_party", args={"action": action}, **INJECTED
+            )
+            self.assertEqual(result["action"], "approve", action)
+
+    def test_read_only_and_tick_actions_pass_ungated(self):
+        for tool_name, args in (
+            ("habitica_status", {}),
+            ("habitica_tasks", {"task_type": "todo"}),
+            ("habitica_tick", {"task_id": TASK_ID}),
+            ("habitica_party", {"action": "summary"}),
+            ("habitica_party", {"action": "chat_list"}),
+            ("habitica_task_create", {"task_type": "todo", "text": "hi"}),
+        ):
+            self.assertIsNone(
+                tools._on_pre_tool_call(tool_name, args=args, **INJECTED), tool_name
+            )
+
+    def test_gate_message_names_the_action(self):
+        msg = tools._on_pre_tool_call(
+            "habitica_task_delete", args={"task_id": TASK_ID}, **INJECTED
+        )["message"]
+        self.assertIn(TASK_ID, msg)
+        self.assertIn("delete", msg.lower())
+
+    def test_manifest_declares_the_hook(self):
+        with open(os.path.join(PLUGIN_DIR, "plugin.yaml")) as fh:
+            manifest = fh.read()
+        self.assertIn("pre_tool_call", manifest)
 
 
 class SchemaTests(unittest.TestCase):
@@ -422,10 +597,7 @@ class SchemaTests(unittest.TestCase):
         )
 
     def test_provides_tools_matches_manifest(self):
-        import re
-
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(root, "plugin.yaml")) as fh:
+        with open(os.path.join(PLUGIN_DIR, "plugin.yaml")) as fh:
             manifest = fh.read()
         for schema, _handler in tools.TOOLS:
             self.assertIn(schema["name"], manifest)
@@ -441,10 +613,9 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("Irreversible", tools.DELETE_SCHEMA["description"])
 
     def test_no_em_dashes_anywhere(self):
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for name in ("plugin.yaml", "README.md", "tools.py", "client.py",
                      "settings.py", "__init__.py"):
-            with open(os.path.join(root, name)) as fh:
+            with open(os.path.join(PLUGIN_DIR, name)) as fh:
                 text = fh.read()
             self.assertNotIn("\u2014", text, name)  # em dash
             self.assertNotIn("\u2013", text, name)  # en dash

@@ -40,7 +40,7 @@ from agent.secret_scope import get_secret
 logger = logging.getLogger(__name__)
 
 API_ROOT = "https://habitica.com/api/v3"
-CLIENT_ID = "hermes-habitica/1.0.0"
+CLIENT_ID = "hermes-habitica/1.0.1"
 
 RETRY_ATTEMPTS = 3
 BACKOFF_CAP_SECONDS = 30.0
@@ -71,19 +71,22 @@ def _credentials() -> tuple[str, str]:
     There is deliberately no environment-variable fallback: if the scoped
     secrets are absent the call fails, even when ``HABITICA_USER_ID`` /
     ``HABITICA_API_TOKEN`` are set in the process environment. (A unit test
-    proves env values are ignored.)
+    proves env values are ignored.) ``get_secret`` returns ``default``
+    (None) on a scoped miss rather than raising, so None and empty are
+    treated as missing here.
     """
     missing: list[str] = []
-    user_id: str | None = None
-    api_token: str | None = None
-    try:
-        user_id = get_secret("HABITICA_USER_ID")
-    except Exception:
-        missing.append("HABITICA_USER_ID")
-    try:
-        api_token = get_secret("HABITICA_API_TOKEN")
-    except Exception:
-        missing.append("HABITICA_API_TOKEN")
+    values: list[str] = []
+    for name in ("HABITICA_USER_ID", "HABITICA_API_TOKEN"):
+        val: str | None = None
+        try:
+            val = get_secret(name)
+        except Exception:
+            val = None
+        if not val or not str(val).strip():
+            missing.append(name)
+        else:
+            values.append(str(val))
     if missing:
         raise HabiticaCredentialsError(
             "Habitica credentials are not configured in Hermes secrets "
@@ -91,7 +94,25 @@ def _credentials() -> tuple[str, str]:
             "`hermes config set plugins.entries.hermes-habitica."
             "requires_env.<name> <value>`."
         )
-    return str(user_id), str(api_token)
+    return values[0], values[1]
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects that leave habitica.com, and never re-send the
+    auth headers to a redirect target (urlopen copies headers)."""
+
+    _AUTH_HEADERS = ("x-api-user", "x-api-key", "x-client", "authorization", "cookie")
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
+        if host != "habitica.com":
+            return None  # urllib then surfaces the 3xx as an HTTPError
+        stripped = {
+            k: v
+            for k, v in req.headers.items()
+            if k.lower() not in self._AUTH_HEADERS
+        }
+        return urllib.request.Request(newurl, headers=stripped, method="GET")
 
 
 class HabiticaClient:
@@ -103,13 +124,21 @@ class HabiticaClient:
         api_token: str,
         timeout: float = 30.0,
         sleeper=time.sleep,
-        urlopen=urllib.request.urlopen,
+        urlopen=None,
     ) -> None:
         self.user_id = user_id
         self.api_token = api_token
         self.timeout = float(timeout)
         self._sleep = sleeper
-        self._urlopen = urlopen
+        if urlopen is not None:
+            self._urlopen = urlopen
+        else:
+            # default path: an opener whose redirect handler never leaves
+            # habitica.com and never re-sends the auth headers (urllib
+            # copies request headers onto redirect targets otherwise)
+            self._urlopen = urllib.request.build_opener(
+                _SafeRedirectHandler()
+            ).open
 
     @classmethod
     def resolve(cls, timeout: float = 30.0) -> "HabiticaClient":
@@ -232,6 +261,11 @@ class HabiticaClient:
     def delete(self, path: str):
         return self.request("DELETE", path)
 
+    @staticmethod
+    def _seg(value: str) -> str:
+        """Quote an id into a URL path segment (no slashes, no query bits)."""
+        return urllib.parse.quote(str(value), safe="")
+
     # ------------------------------------------------------------------
     # API surfaces (all verified against the live API)
     # ------------------------------------------------------------------
@@ -253,14 +287,16 @@ class HabiticaClient:
         return self.post("tasks/user", json_body=body)
 
     def update_task(self, task_id: str, body: dict) -> dict:
-        return self.put("tasks/" + task_id, json_body=body)
+        return self.put("tasks/" + self._seg(task_id), json_body=body)
 
     def delete_task(self, task_id: str) -> dict:
-        return self.delete("tasks/" + task_id)
+        return self.delete("tasks/" + self._seg(task_id))
 
     def score_task(self, task_id: str, direction: str) -> dict:
         """Score a task. ``direction`` is ``up`` or ``down``."""
-        return self.post("tasks/" + task_id + "/score/" + direction)
+        return self.post(
+            "tasks/" + self._seg(task_id) + "/score/" + direction
+        )
 
     def tags(self) -> list:
         return self.get("tags")
@@ -274,14 +310,16 @@ class HabiticaClient:
 
     def party_chat(self, group_id: str, limit: int = 20) -> list:
         return self.get(
-            "groups/" + group_id + "/chat", query={"limit": int(limit)}
+            "groups/" + self._seg(group_id) + "/chat", query={"limit": int(limit)}
         )
 
     def post_party_chat(self, group_id: str, message: str) -> dict:
         """Post to party chat. The message rides in the form body."""
         return self.post(
-            "groups/" + group_id + "/chat", form_body={"message": message}
+            "groups/" + self._seg(group_id) + "/chat", form_body={"message": message}
         )
 
     def delete_party_chat(self, group_id: str, message_id: str) -> dict:
-        return self.delete("groups/" + group_id + "/chat/" + message_id)
+        return self.delete(
+            "groups/" + self._seg(group_id) + "/chat/" + self._seg(message_id)
+        )

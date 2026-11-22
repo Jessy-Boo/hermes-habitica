@@ -53,7 +53,11 @@ hermes config set plugins.entries.hermes-habitica.requires_env.HABITICA_API_TOKE
 - **Writes are real state changes**: ticks, edits and deletes are
   irreversible on Habitica's side; a tick permanently affects streaks,
   stats and gold. The `habitica_tick` tool description instructs the model
-  to tick only when the user names the task or explicitly asks.
+  to tick only when the user names the task or explicitly asks. Task
+  deletion and party chat posting/deleting are additionally gated through
+  Hermes' human-approval system: a `pre_tool_call` hook asks you before
+  each such call runs (fail-closed: a denied or timed-out approval blocks
+  the call).
 - **Party chat**: `chat_post` sends a message visible to party members; it
   cannot be unsent except by deleting your own message (`chat_delete`).
 - **Credentials**: stored in Hermes' scoped secret store, sent only to

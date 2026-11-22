@@ -1,7 +1,7 @@
 name: hermes-habitica
 label: Habitica
 kind: tools
-version: 1.0.0
+version: 1.0.1
 manifest_version: 1
 author: Jessy-Boo
 license: MIT
@@ -29,6 +29,8 @@ provides_tools:
   - habitica_tick
   - habitica_tags
   - habitica_party
+provides_hooks:
+  - pre_tool_call
 config_schema:
   request_timeout_seconds:
     type: int
